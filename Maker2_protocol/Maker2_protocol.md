@@ -1,0 +1,618 @@
+Maker2 protocol
+================
+Xabier Vázquez-Campos
+2017-10-11
+
+-   [Setup](#setup)
+    -   [Variable list](#variable-list)
+    -   [Create control files](#create-control-files)
+    -   [Edit maker\_opts.ctl](#edit-maker_opts.ctl)
+        -   [External gff evidence from Infernal](#external-gff-evidence-from-infernal)
+    -   [Verify maker\_exe.ctl](#verify-maker_exe.ctl)
+-   [Running Maker2](#running-maker2)
+    -   [First run](#first-run)
+        -   [MPI mode](#mpi-mode)
+        -   [Create a backup](#create-a-backup)
+        -   [Get the results](#get-the-results)
+    -   [Second run](#second-run)
+        -   [Training SNAP](#snap1)
+        -   [Training AUGUSTUS](#training-augustus)
+        -   [Changing the control files](#changing-the-control-files)
+        -   [Create a backup (again)](#create-a-backup-again)
+        -   [Get the results (again)](#get-the-results-again)
+    -   [The third (and final) run](#the-third-and-final-run)
+        -   [Retraining SNAP](#snap2)
+        -   [Retraining AUGUSTUS](#retraining-augustus)
+        -   [Changing the control files, one last time](#changing-the-control-files-one-last-time)
+        -   [Get the (final) results (hopefully)](#get-the-final-results-hopefully)
+-   [Annotation](#annotation)
+    -   [Prepare to rename your genes...](#prepare-to-rename-your-genes...)
+    -   [BLAST annotations](#blast-annotations)
+    -   [InterProScan annotations](#interproscan-annotations)
+
+Setup
+-----
+
+### Variable list
+
+``` bash
+BASE_PATH=    #path to folder where you store the genome folder
+MYGENOME=   #abbreviation for the genome
+MYGENOME_DIR=${BASE_PATH}/${MYGENOME}   #folder with all the genome data
+```
+
+### Create control files
+
+Go to your genome folder and execute:
+
+``` bash
+cd ${MYGENOME_DIR}
+mkdir -p maker
+cd maker
+maker -CTL
+```
+
+The last command creates the three control files used by Maker2:
+
+-   maker\_opts.ctl is the file with all the Maker2 running parameters, including the path to the files needed for analysing your genome.
+-   maker\_exe.ctl sets the variables that link to all the programs that Maker2 needs under the hood.
+-   maker\_bopts.ctl is the file that sets the Blast+ search parameters such as e-value.
+
+### Edit maker\_opts.ctl
+
+Edit the following lines in `maker_opts.ctl`:
+
+``` bash
+genome=${MYGENOME}_assembly.fasta
+protein=uniprot_sprot_clean.fasta
+model_org=fungi
+rmlib=PATH/TO/adv_rep/allRepeats.lib
+repeat_protein=te_proteins.fasta
+protein2genome=1
+trna=1
+snoscan_rrna=Sc-rRNA.fa
+cpus=   #number of cpus requested
+min_protein=20
+always_complete=1
+single_exon=1
+```
+
+> It is possible to use additional protein evidence (and you should) but only if the data has been well curated. Bad evidence may result in bad gene models and therefore, missannotated genes/proteins.
+
+> It is important to set `single_exon=1` for the annotation of single-exon gene rich organisms such fungi, otherwise they will be missed.
+
+> If your genome is highly fragmented, e.g. only assembled from short reads, you may want to set `always_complete=0`. Otherwise keep it as indicated above.
+
+> For now, leave `keep_preds=0`. We can turn this on, i.e. `keep_preds=1`, in the last run of Maker2 to get the genes predicted for which we don't have any evidence. Not recommended for complex genomes: source of fake genes.
+
+If **RNA-seq** data is available, you should also modify the following lines:
+
+``` bash
+est=${MYGENOME}_assembled_transcriptome.fasta
+est2genome=1
+correct_est_fusion=1
+```
+
+> You can use `altest=` if you have EST/cDNA from RNA-seq from related organisms.
+> **DO NOT** use predicted transcripts derived from genome annotation, only real transcript evidence.
+
+> Similarly to the `--jaccard_clip` option from Trinity, `correct_est_fusion=1` limits the prediction of falsely fused genes in gene-dense genomes when providing RNA-seq data. A must for fungi, prokaryotes and other organisms with gene-dense genomes.
+
+#### External gff evidence from Infernal
+
+Infernal can be used for the prediction of ncRNA. Although the prediction of tRNA and snoRNA are covered by tRNAscan-SE and snoscan, that are already integrated in Maker2, many other ncRNA can be predicted with Infernal, with the Rfam library.
+First, we calculate the *Z-value*, a probabilistic value dependent on the size of the genome, needed to filter false positives:
+
+``` bash
+Z=$(${ESL}/esl-seqstat ${MYGENOME}_assembly.fasta | grep "Total " | tr -s [:space:] | sed 's/: /\t/g' | cut -f 2)
+Zvalue=$(awk -v i=${Z} 'BEGIN {print i*2/1000000}')
+```
+
+Then we run `Infernal`:
+
+``` bash
+RFAM=/srv/scratch/z3382651/Rfam/12.3  # Path to Rfam.cm
+cmscan -Z ${Zvalue} --rfam --nohmmonly --cut_ga --cpu ${PBS_NUM_PPN} \
+-o ${MYGENOME}_rfam.txt --verbose --fmt 2 \
+--tblout ${MYGENOME}_rfam.tbl \
+--clanin ${RFAM}/Rfam.clanin \
+${RFAM}/Rfam.cm \
+${MYGENOME}_assembly.fasta > ${MYGENOME}.cmscan
+```
+
+To remove overlapping predictions we run:
+
+``` bash
+grep -v " = " ${MYGENOME}_rfam.tbl > ${MYGENOME}_rfam.deoverlapped.tbl
+```
+
+This table contains reliable matches, but it isn't in a gff3 format suitable for Maker2. So we create a custom gff3 file manually:
+
+``` bash
+INPUT=${MYGENOME}_rfam.deoverlapped.tbl
+OUTPUT=${INPUT%.tbl}.gff
+grep -ve "^#" ${INPUT} |\
+tr -s [[:space:]] |\
+sed 's/ /\t/g' |\
+awk '{print $4 "\tRfam\tgene\t" $10 "\t" $11 "\t" $18 "\t" $12 "\t.\tID=infernal-" $4 "-noncoding-" $2 "-gene-" $1 "-ncRNA;Name=infernal-" $4 "-noncoding-" $2 "-gene-" $1 "-ncRNA;Note=" $2 ";Dbxref=Rfam:" $3 ",Rfam:" $6}' |\
+sed 's/Rfam:-//g' > ${OUTPUT}
+```
+
+> The resulting `${MYGENOME}_rfam.deoverlapped.gff` file can be added to `maker_opts.ctl` at `other_gff=`.
+
+### Verify maker\_exe.ctl
+
+Make sure you check the paths of the dependent applications in `maker_exe.ctl`. Maker2 will miss any application that is not in the PATH or in the current loaded environment if e.g. you use conda for installing some programs.
+
+Running Maker2
+--------------
+
+Although you could technically run Maker2 in a single run, the general consensus is to run it iteratively.
+
+### First run
+
+The initial run will use the protein and EST/cDNA and will generate the similarity-based evidence to train SNAP. This is the suggested command:
+
+``` bash
+module purge
+module load perl/5.20.1
+module load boost/1.53
+module load recon/1.08
+module load repeatscout/1.05 
+module load trf/4.09
+module load rmblast/2.2.28
+module load repeatmasker/4.0.7
+module load repeatmodeler/1.0.10
+module load snap/2013-11-29
+module load exonerate/2.2.0
+module load genemark-es/4.33
+module load trnascan-se/1.3.1
+module load blast+/2.2.30
+module load maker/2.31.9
+
+maker -c ${PBS_NUM_PPN} -base ${MYGENOME} ${MYGENOME_DIR}/maker/maker_opts_run1.ctl ${MYGENOME_DIR}/maker/maker_bopts.ctl ${MYGENOME_DIR}/maker/maker_exe.ctl
+```
+
+> We rename `maker_opts.ctl` as `maker_opts_run1.ctl` or similar, so we can keep a record as this file needs to be modified in consecutive runs.
+
+> The `-base` flag simply provides a more appropriate prefix to the folder that Maker2 will be creating rather than a random name. Based on the example, the folder will be named `${MYGENOME}.maker.output`.
+
+**NOTE2**: while the first run is being processed, you can start preparing for the second run, i.e. training GeneMark-ES and AUGUSTUS.
+
+#### MPI mode
+
+Alternatively, we can use MPI to speed things up. Submission is just slightly different:
+
+``` bash
+module purge
+module load openmpi/1.8.3
+module load perl/5.20.1
+module load boost/1.53
+module load recon/1.08
+module load repeatscout/1.05 
+module load trf/4.09
+module load rmblast/2.2.28
+module load repeatmasker/4.0.7
+module load repeatmodeler/1.0.10
+module load snap/2013-11-29
+module load exonerate/2.2.0
+module load genemark-es/4.33
+module load trnascan-se/1.3.1
+module load blast+/2.2.30
+module load maker/2.31.9-mpi
+
+mpiexec -n ${PBS_NUM_PPN} maker -base ${MYGENOME} ${MYGENOME_DIR}/maker/maker_opts_run1.ctl ${MYGENOME_DIR}/maker/maker_bopts.ctl ${MYGENOME_DIR}/maker/maker_exe.ctl
+```
+
+> Remember to use `pvmem` (memory to use per cpu) instead of `vmem`.
+
+> In `maker_opts.ctl`, you need to set `cpus=1`.
+
+#### Create a backup
+
+In case something goes wrong in the following runs, it's recommendable to backup the initial output folder as the output folder will be largely overwritten in the subsequent runs. By now, just tar it. Creating a `*.tar.gz` takes too long.
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+tar cvf ${MYGENOME}.maker.output_run1.tar ${MYGENOME}.maker.output/
+```
+
+#### Get the results
+
+Before continuing with the next run, I like to keep whatever was generated during this one, i.e. the gff and fasta files.
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+mkdir -p results_run1
+cd results_run1
+gff3_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+fasta_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+```
+
+### Second run
+
+#### Training SNAP
+
+Before even modifying the control files, we need to train SNAP:
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+mkdir -p snap1
+cd snap1
+ln -s ../results1/${MYGENOME}.all.gff ${MYGENOME}.all.gff
+maker2zff ${MYGENOME}.all.gff
+```
+
+> You should to check the output of `maker2zff` in case the output is empty. If that's the case, you need to change its options, e.g. not filtering evidences without EST overlapping if you don't have any cDNA data.
+
+> `maker2zff -n` is the most drastic option and indicates "no filter". This should only be used as last resource because all possible genes will be included, regardless the existence of any evidence or the scoring.
+
+``` bash
+fathom genome.ann genome.dna -categorize 1000
+fathom uni.ann uni.dna -export 1000 -plus
+forge export.ann export.dna
+hmm-assembler.pl ${MYGENOME} . > ${MYGENOME}.snap1.hmm
+```
+
+The final hmm file is the SNAP training profile that will be used for the gene prediction step.
+
+#### Training AUGUSTUS
+
+Nowadays, we use BUSCO v3 (or whatever version is the last) to train AUGUSTUS. BUSCO creates an AUGUSTUS profile by default when run in `--mode genome`, which can be iteratively improved with the `--long` option.
+
+``` bash
+cd ${BASE_PATH}/${MYGENOME}
+run_busco --cpu ${PBS_NUM_PPN} --out ${MYGENOME} --long \
+--lineage_path ${LINEAGE} --mode genome \
+--in ${MYGENOME}_assembly.fasta
+```
+
+> The output will be a folder such as `run_${MYGENOME}/` defined by `--out`.
+
+By default, and if you have writing access to the AUGUSTUS config folder, BUSCO will automatically create `config/species/run_${MYGENOME}/`, i.e. the AUGUSTUS species profile that can be automatically called from the command line. If you didn't have access to it or for some reason BUSCO didn't create such folder, you can find it in `run_${MYGENOME}/`. You just need to place a copy where it should be.
+
+``` bash
+mkdir -p config/species/${MYGENOME}
+cp run_${MYGENOME}/augustus_output/retraining_parameters/* config/species/${MYGENOME}/
+run_busco --cpu ${PBS_NUM_PPN} --out ${MYGENOME} --long \
+--lineage_path ${LINEAGE} --mode genome \
+--in ${MYGENOME}_assembly.fasta
+```
+
+> The files in `run_${MYGENOME}/augustus_output/retraining_parameters/` have names that start with this pattern: `BUSCO_${MYGENOME}_1234567890`.
+> Before you can use it, you need to change the species folder name and the `BUSCO_${MYGENOME}_1234567890` string to be the same. Otherwise AUGUSTUS won't recognise the species profile properly. Using `${MYGENOME}` is the usual choice.
+
+##### AUGUSTUS... the old way
+
+Alternatively, you can train AUGUSTUS in a more "manual" way, like when we were using CEGMA. The training starts with the output from the second instance of `fathom` in the [SNAP training section](#snap1).
+
+``` bash
+cd snap1
+perl ~/bin/zff2augustus_gbk.pl > ${MYGENOME}.train1.gb
+```
+
+> `zff2augustus_gbk.pl` generates a GenBank file from `export.dna`.
+
+The actual training of AUGUSTUS will be through the [webAUGUSTUS server](bioinf.uni-greifswald.de/webaugustus/training/create).
+
+Before proceed, it is recommended to rename the fasta headers, specially if they contain special characters and/or very long headers. This is the main reason of failure for the jobs submitted to webAUGUSTUS. You can use the [`simplifyFastaHeaders.pl`](http://bioinf.uni-greifswald.de/bioinf/downloads/simplifyFastaHeaders.pl) script for that:
+
+``` bash
+perl ~/bin/simplifyFastaHeaders.pl ${MYGENOME}_assembly.fasta nameStem ${MYGENOME}_contigs_rename.fasta ${MYGENOME}_contigs.map
+
+perl ~/bin/simplifyFastaHeaders.pl ${MYGENOME}_transcripts_assembled.fasta nameStem ${MYGENOME}_rna_rename.fasta ${MYGENOME}_rna.map
+```
+
+> `nameStem` is the base name for naming each of the sequences in the multifasta files. Use a value with something appropriate. Use *contig* and *rna* for the assembly and RNA-seq files, respectively; or something based on that. For example, 'pgcontig' and 'pgrna' for contigs and RNA from *Puccinia graminis*
+> **DO NOT** give the same `nameStem` to both fasta files, and don't use any special character.
+
+We need the following files (minimum):
+
+-   `${MYGENOME}_assembly.fasta` as *Genome file*
+-   `${MYGENOME}.train1.gb` as *Training gene structure file*
+
+If we also have RNA-seq data:
+
+-   `${MYGENOME}_assembled_transcripts.fasta` as *cDNA file*
+
+Use `${MYGENOME}_v1` as *Species name*. We will need to have a different species name in the retraining step. Otherwise when Maker2 is rerun, Maker2 will see the same name and will not rerun AUGUSTUS, even though the species profile is different. So, `${MYGENOME}_v1` just do the job and tracks version.
+
+Once the job is finished, the *Species parameter archive* (`parameters.tar.gz`) will contain a folder with the model files for your species. Copy it to the species folder of your AUGUSTUS installation.
+
+grep -v "repeatmasker|protein2genome|snoscan|repeatrunner|trnascan|blastx" results1/pugra1.all.gff &gt; pugra1.all.rna\_only.gff
+
+#### Changing the control files
+
+As said before, each run needs to have its own `maker_opts.ctl` file. This needs to be retouched before each iteration:
+
+``` bash
+cp maker_opts_run1.ctl maker_opts_run2.ctl
+```
+
+For the second run, you need to change the following lines in the new `maker_opts_run2.ctl`:
+
+``` bash
+snaphmm=${MYGENOME_DIR}/maker/snap1/${MYGENOME}.snap1.hmm
+gmhmm=${MYGENOME_DIR}/maker/gmhmm.mod
+augustus_species=${MYGENOME}  #see section on training AUGUSTUS
+est2genome=0
+protein2genome=0
+```
+
+Now execute as before but change the `maker_exe.ctl` file in use:
+
+``` bash
+maker -c ${PBS_NUM_PPN} -base ${MYGENOME} ${MYGENOME_DIR}/maker/maker_opts_run2.ctl ${MYGENOME_DIR}/maker/maker_bopts.ctl ${MYGENOME_DIR}/maker/maker_exe.ctl
+```
+
+#### Create a backup (again)
+
+As before:
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+tar cvf ${MYGENOME}.maker.output_run2.tar ${MYGENOME}.maker.output/
+```
+
+#### Get the results (again)
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+mkdir -p results_run2
+cd results_run2
+gff3_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+fasta_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+```
+
+In this case, `fasta_merge` will output fasta files from the predictions of each *ab initio* gene predictor. At this point it is a good idea to check how many proteins they are predicting. Just:
+
+``` bash
+grep -c ">" *.fasta
+```
+
+> This is a fast and easy way to evaluate if we may need to ditch one of the gene predictors, or if they have to be trained with a different method, e.g. BUSCO-trained AUGUSTUS underpredicting so we go back one step and redo the training [the old way](#augustus_old).
+
+### The third (and final) run
+
+#### Retraining SNAP
+
+Before even modifying the control files, we need to train SNAP:
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+mkdir -p snap2
+cd snap2
+cp ../results_run2/${MYGENOME}.all.gff ./
+maker2zff ${MYGENOME}.all.gff
+```
+
+> You should to check the output of `maker2zff` in case the output is empty. If that's the case, you need to change its options, e.g. not filtering evidences without EST overlapping if you don't have any cDNA data.
+
+> `maker2zff -n` is the most drastic option and indicates "no filter". This should only be used as last resource because all possible genes will be included, regardless the existence of any evidence or the scoring.
+
+``` bash
+fathom genome.ann genome.dna -categorize 1000
+fathom uni.ann uni.dna -export 1000 -plus
+forge export.ann export.dna
+hmm-assembler.pl ${MYGENOME} . > ${MYGENOME}.snap2.hmm
+```
+
+The final hmm file is the SNAP training profile that will be used for the gene prediction step.
+
+#### Retraining AUGUSTUS
+
+If we used BUSCO, we have no need to retrain AUGUSTUS, as BUSCO already does it. But if we do it the [old way](#augustus_old), we need to retrain it.
+
+``` bash
+cd snap2
+perl ~/bin/zff2augustus_gbk.pl > ${MYGENOME}.train2.gb
+```
+
+In [webAUGUSTUS server](bioinf.uni-greifswald.de/webaugustus/training/create):
+
+-   `${MYGENOME}_assembly.fasta` as *Genome file*
+-   `${MYGENOME}.train2.gb` as *Training gene structure file*
+
+If we also have RNA-seq data:
+
+-   `${MYGENOME}_assembled_transcripts.fasta` as *cDNA file*
+
+#### Changing the control files, one last time
+
+As said before, each run needs to have its own `maker_opts.ctl` file. This needs to be retouched before each iteration:
+
+``` bash
+cp maker_opts_run2.ctl maker_opts_run3.ctl
+```
+
+For the second run, you need to change the following lines in the new `maker_opts_run3.ctl`:
+
+``` bash
+snaphmm=${MYGENOME_DIR}/maker/snap1/${MYGENOME}.snap2.hmm
+keep_preds=1
+```
+
+If the old AUGUSTUS training method was used, you also need to change the following line (thank you captain obvious):
+
+``` bash
+augustus_species=${MYGENOME}2
+```
+
+Now execute as before but change the `maker_exe.ctl` file in use:
+
+``` bash
+maker -c ${PBS_NUM_PPN} -base ${MYGENOME} ${MYGENOME_DIR}/maker/maker_opts_run3.ctl ${MYGENOME_DIR}/maker/maker_bopts.ctl ${MYGENOME_DIR}/maker/maker_exe.ctl
+```
+
+#### Get the (final) results (hopefully)
+
+``` bash
+cd ${MYGENOME_DIR}/maker/
+mkdir -p results_run3
+cd results_run3
+gff3_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+fasta_merge -d ../${MYGENOME}.maker.output/${MYGENOME}_master_datastore_index.log
+```
+
+Annotation
+----------
+
+Before starting the annotation, better create a copy of the original files into a new folder as a backup, e.g. in case you need to redo the annotations:
+
+``` bash
+mkdir -p annotation
+cp * annotation/
+```
+
+Remove fasta files specific from gene predictors (not needed), but keep those from RNA predictors (e.g. tRNAscan-SE):
+
+``` bash
+cd annotation/
+rm *snap* *genemark* *augustus*
+```
+
+### Prepare to rename your genes...
+
+Create the mapping file. You need to select an appropriate prefix for your genome
+
+``` bash
+maker_map_ids --prefix PGAV_ --justify 8 ${MYGENOME}.all.gff > ${MYGENOME}.map
+```
+
+> I usually select four-letter prefixes that summarises the organism name the best it could, e.g.:
+> - 'PGAV' for *Puccinia graminis* f. sp. *avenae* (this will be used in this protocol)
+> - 'CFOD' for *Coniochaeta fodinicola*
+
+Create `*.renamed.fasta` and `*.renamed.gff` files
+
+``` bash
+for i in *.fasta
+do
+cp ${i} ${i%.fasta}.renamed.fasta
+done
+
+cp ${MYGENOME}.all.gff ${MYGENOME}.all.renamed.gff
+rm *s.fasta ${MYGENOME}.all.gff   # remove the original files in the annotation folder
+```
+
+Time to rename...
+
+``` bash
+map_gff_ids ${MYGENOME}.map ${MYGENOME}.all.renamed.gff
+
+for i in *.renamed.fasta
+do
+map_fasta_ids ${MYGENOME}.map ${i}
+done
+```
+
+> Now the last column of your gff file should have some annotation such `ID=PGAV_00171741`
+> And the headers of the fasta file have something similar, e.g. `>PGAV_00171741` followed by all the other scores legacy from maker.
+
+### BLAST annotations
+
+Similarity-based annotations require blasting your proteins against UniProt-SwissProt database (<http://www.uniprot.org>). Maker2 workflow requires this specific database due to the fasta header structure.
+
+Create a BLAST database:
+
+``` bash
+makeblastdb -in uniprot_sprot.fasta -input_type fasta -dbtype prot -out uniprot_sprot
+```
+
+> It is a good idea to add the download date of the UniProt-SwissProt fasta file to the database name and/or to the fasta file to keep track of the version used in the annotation.
+
+Split your `${MYGENOME}.all.maker.proteins.renamed.fasta` files. This is optional but you can speed this up using a computing cluster and processing in parallel.
+
+``` bash
+mkdir -p split_fasta/
+cd split_fasta/
+perl fasta-splitter.pl --part-size 1500 --measure count ../${MYGENOME}.all.maker.proteins.renamed.fasta
+```
+
+> This creates *n* fasta files with a number of sequences defined by `--part-size` with the following name structure: `${MYGENOME}.all.maker.proteins.renamed.part-10.fasta`
+
+Time to BLAST...
+
+``` bash
+BASE_PATH=  # modify according to your folder structure
+FASTA_PATH=${BASE_PATH}/split_fasta
+DB=/srv/scratch/z3382651/uniprot_sprot/uniprot_sprot  # path to sprot db
+
+mkdir -p ${FASTA_PATH}/blast  # BLAST output folder
+
+blastp -query ${FASTA_PATH}/${MYGENOME}.all.maker.proteins.renamed.part-${PBS_ARRAYID}.fasta -db ${DB} \
+-out ${FASTA_PATH}/blast/${MYGENOME}.all.maker.proteins.renamed.part-${PBS_ARRAYID}.blastout.tsv \
+-num_threads 2 -outfmt 6 -evalue 0.000001 -seg yes -soft_masking true -lcase_masking -max_hsps 1
+```
+
+> `-seg yes` helps reducing spurious matches derived by identities between low-complexity regions in the proteins by changing the amino acids in those regions with *X*'s.
+> Brief explaination in [ExPASy's BLAST help](http://web.expasy.org/blast/blast+_help.html) (see Filter low complexity regions)
+
+> Each 1500-protein chunk takes about 35 minutes to complete.
+
+Now you need to merge the output from each BLAST run
+
+``` bash
+cd results/
+cat split_fasta/blast/${MYGENOME}.all.maker.proteins.renamed.part-*.tsv > ${MYGENOME}.all.maker.proteins.renamed.blastout.tsv
+```
+
+Add the BLAST functional annotation to the
+
+``` bash
+SPROT_FASTA=/srv/scratch/z3382651/uniprot_sprot/uniprot_sprot.fasta
+
+maker_functional_gff ${SPROT_FASTA} ${MYGENOME}.all.maker.proteins.renamed.blastout.tsv ${MYGENOME}.all.renamed.gff > ${MYGENOME}.all.renamed.func.gff
+
+maker_functional_fasta ${SPROT_FASTA} ${MYGENOME}.all.maker.proteins.renamed.blastout.tsv ${MYGENOME}.all.maker.proteins.renamed.fasta > ${MYGENOME}.all.maker.proteins.renamed.func.fasta
+
+maker_functional_fasta ${SPROT_FASTA} ${MYGENOME}.all.maker.proteins.renamed.blastout.tsv ${MYGENOME}.all.maker.transcripts.renamed.fasta > ${MYGENOME}.all.maker.transcripts.renamed.func.fasta
+```
+
+### InterProScan annotations
+
+InterProScan is used to add additional protein annotations such as protein families or specific domains (e.g. transmembrane regions). This annotation needs to be performed on the renamed protein fasta file, so we reuse the splitted file.
+
+``` bash
+module load java/8u91
+module load perl/5.20.1
+module load signalp/4.1
+module load tmhmm/2.0c
+module load interproscan/5.25-64.0
+
+BASE_PATH=  # modify according to your folder structure
+FASTA_PATH=${BASE_PATH}/split_fasta
+
+mkdir -p ${FILES}/iprs
+
+interproscan.sh -i ${FASTA_PATH}/${MYGENOME}.all.maker.proteins.renamed.part-${PBS_ARRAYID}.fasta \
+-b ${FASTA_PATH}/iprs/${MYGENOME}.all.maker.proteins.renamed.part-${PBS_ARRAYID}.iprsout \
+-cpu 8 -dp -t p -pa -goterms -iprlookup \
+-T ${FASTA_PATH}/iprs/tmp \
+-appl TIGRFAM,SFLD,Phobius,SUPERFAMILY,PANTHER,Gene3D,Hamap,ProSiteProfiles,Coils,SMART,CDD,PRINTS,ProSitePatterns,SignalP_EUK,Pfam,ProDom,MobiDBLite,PIRSF,TMHMM
+```
+
+> Although I use all the relevant applications available for InterProScan, many can be redundant. I suggest to use, at least, Pfam, TIGRFAM, SignalP\_EUK and Phobius as minimal options.
+
+> Each 1500-protein chunk takes about 1 hour to complete.
+
+> Note that this script is meant to be used in a job array submission to a PBS/Torque cluster
+
+Like with the BLAST output...
+
+``` bash
+cd results/
+cat split_fasta/iprs/${MYGENOME}.all.maker.proteins.renamed.part-*.tsv > ${MYGENOME}.all.maker.proteins.renamed.iprsout.tsv
+```
+
+We add now the protein domains from InterProScan to the gff file
+
+``` bash
+ipr_update_gff ${MYGENOME}.all.renamed.func.gff ${MYGENOME}.all.maker.proteins.renamed.iprsout.tsv > ${MYGENOME}.all.renamed.func.protdom.gff
+```
+
+We can also create a track with
+
+``` bash
+iprscan2gff3 ${MYGENOME}.all.maker.proteins.renamed.iprsout.tsv ${MYGENOME}.all.renamed.gff > ${MYGENOME}.all.renamed.visible_domains.gff 
+```

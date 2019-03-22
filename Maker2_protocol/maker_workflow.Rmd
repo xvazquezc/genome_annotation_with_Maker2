@@ -1,0 +1,126 @@
+---
+#title: "Maker workflow"
+#author: "Xabier Vazquez-Campos"
+#date: "6 October 2017"
+output: 
+  html_document
+---
+
+```{r setup, eval=TRUE, echo=FALSE}
+library(DiagrammeR)
+grViz("
+digraph nicegraph {
+
+  # graph, node, and edge definitions
+  graph [compound = true]
+
+
+  # program nodes
+  node [fontname = Helvetica, shape = rectangle, fontsize = 12, fixedsize = true,
+        color = darkslategray, width = 1.5]
+  Maker[label='Maker2']
+  RMa[label='RepeatMasker']
+  RMo[label='RepeatModeler']
+  HS[label='HISAT2']
+  Trin[label='Trinity\nde novo']
+  TrinGG[label='Trinity\nGenome Guided']
+  Trim[label='Trim galore!']
+  GM[label='GeneMark-ES/ET']
+#  simp[label='simplifyFastaHeaders.pl']
+  BLAT[label='BLAT']
+#  AA[label='autoAug.pl']
+  AAP[label='autoAugPred.pl']
+  AAT[label='autoAugTrain.pl']
+  psl[label='pslCDnaFilter']
+  MH[label='MITE Hunter']
+  gt[label='GenomeTools\nLTRharvest']
+  inf[label='Infernal']
+  
+  # data
+  node [fontname = Helvetica, shape = oval, fontsize = 10, color = darkslategray, width = 1.6]
+  RNA[label='RNA reads']
+  qcRNA[label='Trimmed\nRNA reads']
+  RNAseq[label='Assembled RNA']
+  RNAnov[label='de novo\nassembled RNA']
+  RNAgg[label='genome-guided\nassembled RNA']
+  RNAbam[label='mapped RNA reads']
+  smDNA[label='soft-masked\ngenome']
+  RNAren[label='RNAseq\nrenamed']
+  DNAren[label='genome\nrenamed']
+  DNA[label='assembled\ngenome']
+  hints[label='hints.gff']
+  train[label='AUGUSTUS\ntraining file']
+  cdna[label='cdna.psl']
+  fcdna[label='cdna.f.psl']
+  spau[label='AUGUSTUS\nspecies model']
+  repre[label='redundant\npredictions']
+  mite[label='MITE.lib']
+  LTR[label='allLTR.lib']
+  rmod[label='RepeatModeler\nlibrary']
+  gfrag[label='Gene\nfragments']
+  reli[label='Advanced\nRepeat Library']
+  gmes[label='gmes.mod\nGeneMark model']
+  rfam[label='RFAM\nncRNA']
+
+  # processing edges
+  edge [color = grey, arrowhead = normal, arrowsize = 0.5, arrowtail = none, fontsize = 8]
+  RNA -> Trim
+  Trim -> qcRNA
+  qcRNA -> {HS Trin}
+  DNA -> {RMa rfam}
+  RMa -> smDNA
+  DNAren -> HS
+  HS -> RNAbam
+  RNAbam -> TrinGG
+  TrinGG -> RNAgg
+  Trin -> RNAnov
+  {RNAnov RNAgg} -> RNAseq
+  RNAseq -> RNAren[label='simplifyFastaHeaders.pl']
+  smDNA -> DNAren[label='simplifyFastaHeaders.pl']
+  {hints DNAren} -> GM
+  {RNAren DNAren} -> BLAT [lhead=cluster0]
+  {train hints DNAren RNAren} -> AAT
+  AAP -> spau [ltail=cluster0]
+  mite -> reli [ltail=cluster1]
+  Maker -> train
+  GM -> gmes
+  {reli gmes spau RNAseq DNA rfam} -> Maker
+  reli -> RMa
+  inf -> rfam
+  
+  
+
+  # discarding edges
+  edge [color = grey, arrowhead = diamond, arrowtail = none, fontsize = 6]
+  RMo -> repre[ltail=cluster1]
+  RMo -> gfrag[ltail=cluster1]
+
+  #autoAug.pl
+  subgraph cluster0 {
+      node []
+      label='autoAug.pl'
+      color = crimson
+      AAT -> AAP
+      BLAT -> cdna
+      cdna -> psl
+      psl -> fcdna
+      fcdna -> hints[label='blat2hints.pl']
+  }
+  subgraph cluster1 {
+      node []
+      label='Repeat library - Advanced'
+      color = crimson
+      MH -> mite
+      gt -> LTR
+      RMo -> rmod
+  }
+
+  #Advanced repeats
+
+#  subgraph {
+#  rank = same; RMo; repre;
+#  }
+}
+", height = 900)
+```
+

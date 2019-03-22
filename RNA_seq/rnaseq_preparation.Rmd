@@ -1,0 +1,142 @@
+---
+title: "RNA-seq for genome assembly"
+author: "Xabier Vazquez-Campos"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 4
+---
+
+## Directory structure
+```{bash dir-str, eval=FALSE}
+# \
+# |-- ${MYGENOME}
+# |   |-- RNAseq
+# |       |-- raw
+# |       |   |-- trimmed
+# |       |-- deconseq
+# |       |-- trinity_denovo
+# |       |-- trinity_guided
+```
+
+## Pre-requisites
+### Files
+* RNA-seq reads
+* Genome assembly
+
+### Software
+* Trim galore!, `conda install trim-galore`
+* [DeconSeq](http://deconseq.sourceforge.net/)
+* [PRINSEQ](http://prinseq.sourceforge.net/)
+* HISAT2, `conda install hisat2`
+* Trinity, `conda install trinity`
+
+
+## Protocol
+### Pre-processing of Illumina reads
+As QC step, first we need to remove rogue adapters and low quality sequences. People don't usually remove adapters but the quality trimming is a must:
+
+```{bash trim, eval=FALSE}
+cd ${MYGENOME}/RNAseq/raw
+trim_galore --illumina -o trimmed/ --no_report_file --dont_gzip --paired OSR_S5_L002_R1_001.fastq OSR_S5_L002_R2_001.fastq --retain_unpaired
+```
+> Trim galore! can take gzipped files, no need to unzip them beforehand.
+
+> If fastq files aren't compressed, add the `--gzip` flag and the output will be gzipped on the fly. (Both HISAT2 and Trinity can take .gz files as input). However, if you need to run DeconSeq, force the uncompressed output with `--dont_gzip`.
+
+> `--retain_unpaired` keeps the orphan reads.
+
+
+### Remove contaminants with DeconSeq
+DeconSeq is very slow: single-threaded and it processes a single file at a time. Use an array submission to the cluster if possible. It also requires quite a lot of memory.  
+You may require to create your own database to detect contaminants. Refer to the README in the DeconSeq folder.
+```{bash deconseq, eval=FALSE}
+RNA_DIR=/srv/scratch/z3382651/sbi/pugra/RNAseq
+FQ_DIR=${RNA_DIR}/raw/trimmed
+RNA_FQ=($(ls ${FQ_DIR}/*.fq))
+DECON_DIR=${RNA_DIR}/deconseq
+
+cd ${DECON_DIR}
+
+for i in ${PBS_ARRAYID}
+do
+f=$(basename ${RNA_FQ[PBS_ARRAYID]})
+cd ${DECON_DIR}
+perl ~/bin/deconseq-standalone-0.4.3/deconseq.pl -dbs pugra -f ${RNA_FQ[PBS_ARRAYID]} -out_dir ${DECON_DIR} -id ${f%.fq}_deconseq
+done
+```
+
+
+
+
+### Mapping RNA-seq reads with HISAT2
+HISAT is the next generation of TopHat.
+
+```{bash hisat, eval=FALSE}
+PREFIX=pugra
+RNA_DIR=/srv/scratch/z3382651/sbi/pugra/RNAseq
+FQ_DIR=${RNA_DIR}/deconseq/good/combined
+RNA_R1=${FQ_DIR}/OSR_S5_L001_R1_001_val_1.fq.gz_deconseq_cont.fq_pairs_R1.fastq,${FQ_DIR}/OSR_S5_L002_R1_001_val_1.fq.gz_deconseq_cont.fq_pairs_R1.fastq
+RNA_R2=${FQ_DIR}/OSR_S5_L001_R2_001_val_2.fq.gz_deconseq_cont.fq_pairs_R2.fastq,${FQ_DIR}/OSR_S5_L002_R2_001_val_2.fq.gz_deconseq_cont.fq_pairs_R2.fastq
+RNA_U=${FQ_DIR}/OSR_S5_R1_unpaired.fastq,${FQ_DIR}/OSR_S5_R2_unpaired.fastq,${FQ_DIR}/OSR_S5_decon_singles.fastq
+GENOME=/srv/scratch/z3382651/sbi/pugra/assembly/run_6_lcutoff_6k_lcutoffpr_6k/pilon_error_correction/pilon_output/corrected.fasta
+
+cd ${RNA_DIR}
+
+hisat2-build ${GENOME} ${PREFIX}
+
+hisat2 --max-intronlen 3000 -p ${PBS_NUM_PPN} -x ${PREFIX} -1 ${RNA_R1} -2 ${RNA_R2} -U ${RNA_U} -S ${PREFIX}.sam
+samtools view -@ ${PBS_NUM_PPN} -bT ${GENOME} ${PREFIX}.sam -o ${PREFIX}.bam
+samtools sort -@ ${PBS_NUM_PPN} ${PREFIX}.bam -o ${PREFIX}.sort.bam -T temp_${PREFIX}
+```
+
+### Assembling RNA-seq reads with Trinity
+Trinity can assemble RNA-seq reads _de novo_ or using the assembled genome as a guide (that's why we do the mapping with HISAT2).
+
+#### Trinity: _de novo_ assembly
+```{bash trindenovo, eval=FALSE}
+source activate myconda3
+
+PREFIX=pugra
+RNA_DIR=/srv/scratch/z3382651/sbi/pugra/RNAseq
+FQ_DIR=${RNA_DIR}/deconseq/good/combined
+RNA_R1=${FQ_DIR}/OSR_S5_L001_R1_001_val_1.fq.gz_deconseq_cont.fq_pairs_R1.fastq,${FQ_DIR}/OSR_S5_L002_R1_001_val_1.fq.gz_deconseq_cont.fq_pairs_R1.fastq
+RNA_R2=${FQ_DIR}/OSR_S5_L001_R2_001_val_2.fq.gz_deconseq_cont.fq_pairs_R2.fastq,${FQ_DIR}/OSR_S5_L002_R2_001_val_2.fq.gz_deconseq_cont.fq_pairs_R2.fastq
+RNA_U1=${FQ_DIR}/OSR_S5_R1_unpaired.fastq
+RNA_U2=${FQ_DIR}/OSR_S5_R2_unpaired.fastq
+
+cd ${RNA_DIR}
+
+Trinity --seqType fq --max_memory 12G --CPU ${PBS_NUM_PPN} \
+--left ${RNA_R1},${RNA_U1} \
+--right ${RNA_R2},${RNA_U2} \
+--output ${RNA_DIR}/trinity_denovo
+```
+> __IMPORTANT__: the `--max_memory` flag sets the maximum memory per cpu not the total maximum memory. This is not explicitly indicated in the help and source of failure.
+
+> `--jaccard_clip` is supposed to be a must-to-include flag for gene-dense compact genomes (e.g. fungi) where genes can be falsely fused due to overlapping UTR regions being mistaken as introns. However, for some reason this hasn't been working as expected, with zero assembled sequences when used.
+
+#### Trinity: genome-guided assembly
+
+```{bash tringg, eval=FALSE}
+source activate myconda3
+module load hisat2/2.0.5
+
+PREFIX=pugra
+RNA_DIR=/srv/scratch/z3382651/sbi/pugra/RNAseq
+HISAT_BAM=${RNA_DIR}/${PREFIX}.sort_normal.bam
+
+cd ${RNA_DIR}
+
+Trinity --max_memory 12G --CPU ${PBS_NUM_PPN} --genome_guided_max_intron 3000 \
+--genome_guided_bam ${HISAT_BAM} \
+--output ${RNA_DIR}/trinity_guided
+```
+
+### Merge evidence
+```{bash merge, eval=FALSE}
+cd ${RNA_DIR}
+
+cat trinity_guided/Trinity-GG.fasta trinity_denovo/Trinity.fasta > ${PREFIX}_RNAseq.fasta
+```
